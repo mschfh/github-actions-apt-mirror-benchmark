@@ -98,7 +98,7 @@ jobs:
 
           echo "fastest mirror reported: $(tail -n1 /tmp/find.stdout)"
 
-      - name: Telemetry (scoped: instruments only the steps after this point)
+      - name: Telemetry (instruments only the steps after this point)
         # Node16 runtime — expect a deprecation warning; kept because requested.
         # Alternative: catchpoint/workflow-telemetry-action@v2 (upstream this
         # was forked from, node20). If scoping ever needs to be tighter, the
