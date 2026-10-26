@@ -98,6 +98,20 @@ jobs:
 
           echo "fastest mirror reported: $(tail -n1 /tmp/find.stdout)"
 
+      - name: Telemetry (scoped: instruments only the steps after this point)
+        # Node16 runtime — expect a deprecation warning; kept because requested.
+        # Alternative: catchpoint/workflow-telemetry-action@v2 (upstream this
+        # was forked from, node20). If scoping ever needs to be tighter, the
+        # only native way is moving the e2e apt step into its own job.
+        uses: tum-i4/workflow-telemetry-action@69c3d3de0e4c61f8a5f67d9ec6e8bafefdafe287 # v1.0
+        with:
+          proc_trace_min_duration: 100 # ms; skip micro processes
+          proc_trace_chart_show: true
+          proc_trace_table_show: false
+          comment_on_pr: false
+          job_summary: true
+          metric_frequency_thousands_of_second: 250
+
       - name: End-to-end apt timing (update + install ffmpeg)
         run: |
           # Measures what users actually experience: full apt-get update (all
@@ -124,12 +138,39 @@ jobs:
           record "apt-get update (cold)" "$(dur "$(now)" "$t0")" "$rc"
 
           t0=$(now)
-          # ffmpeg is preinstalled on the runners; --reinstall forces a real
-          # download of the .deb + binary libs through the configured mirrors
+          # ffmpeg is preinstalled on the runners; -d + --reinstall forces the
+          # full .deb + lib set to be downloaded through the configured mirrors,
+          # while -d (download-only) leaves the system untouched
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -y -qq \
-            --reinstall --no-install-recommends install ffmpeg 2>&1 | tee /dev/stderr
+            --reinstall -d --no-install-recommends install ffmpeg 2>&1 | tee /dev/stderr
           rc=${PIPESTATUS[0]}
-          record "apt-get install --reinstall ffmpeg" "$(dur "$(now)" "$t0")" "$rc"
+          record "apt-get install -d --reinstall ffmpeg (download only)" "$(dur "$(now)" "$t0")" "$rc"
+
+      - name: Per-URL timed fetch — every index target apt update would download
+        run: |
+          # `apt-get indextargets` is apt's own enumeration of every URI the
+          # update phase would fetch. Timing each one (sequential curl) shows
+          # exactly WHICH file is slow (per-request overhead / edge-cache
+          # miss / origin fetch) — data apt itself never reports.
+          set -o pipefail
+          : > /tmp/perfile.tsv
+
+          sudo apt-get indextargets 2>/dev/null \
+            | sed -n 's/^URI: //p' | sort -u > /tmp/targets.txt
+          echo "index targets: $(wc -l < /tmp/targets.txt)"
+          [ -s /tmp/targets.txt ] || { echo "WARNING: no targets enumerated"; exit 0; }
+
+          while IFS= read -r uri; do
+            st=$(curl -fsSL -m 60 -sS -o /dev/null \
+                    -w '%{http_code}\t%{time_starttransfer}\t%{size_download}\t%{speed_download}\t%{time_total}' \
+                    "$uri") || true
+            [ -n "$st" ] || st=$(printf '000\t0\t0\t0\t0')
+            printf '%s\t%s\n' "$uri" "$st" | tee -a /tmp/perfile.tsv
+          done < /tmp/targets.txt
+
+          awk -F'\t' '{ d+=$4; t+=$6; n++ }
+            END { printf "TOTAL\t%.1f MB\t%.1f s\t%d files\teffective %.2f MB/s\n",
+                  d/1048576, t, n, (t>0 ? d/1048576/t : 0) }' /tmp/perfile.tsv | tee /tmp/perfile.total
 
       - name: Write run summary
         if: always()
@@ -185,6 +226,23 @@ jobs:
               [ -n "$phase" ] || continue
               printf '| %s | %s | %s |\n' "$phase" "$secs" "$rc"
             done < /tmp/e2e.log
+            echo
+            echo "## Per-URL index timing (apt-get indextargets URIs, sequential curl)"
+            echo
+            echo "Total: \`$(cat /tmp/perfile.total 2>/dev/null || echo "n/a")\`"
+            echo
+            echo "### 10 slowest targets (by total time)"
+            echo
+            echo "| URI | http | TTFB (s) | size (MB) | MB/s | total (s) |"
+            echo "|---|---|---|---|---|---|"
+            sort -t$'\t' -k6,6 -gr /tmp/perfile.tsv 2>/dev/null | head -n 10 | \
+              while IFS=$'\t' read -r uri code ttfb bytes speed total; do
+                [ -n "$uri" ] || continue
+                printf '| %s | %s | %s | %s | %s | %s |\n' "$uri" "$code" "$ttfb" \
+                  "$(awk -v b="${bytes:-0}" 'BEGIN{printf "%.2f", b/1048576}')" \
+                  "$(awk -v s="${speed:-0}" 'BEGIN{printf "%.1f", s/1048576}')" \
+                  "$(awk -v t="${total:-0}" 'BEGIN{printf "%.3f", t}')"
+              done
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw logs
@@ -198,4 +256,7 @@ jobs:
             /tmp/find.log
             /tmp/find.stdout
             /tmp/e2e.log
+            /tmp/perfile.tsv
+            /tmp/perfile.total
+            /tmp/targets.txt
           if-no-files-found: warn
