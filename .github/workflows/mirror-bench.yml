@@ -17,6 +17,9 @@ name: apt-mirror-benchmark
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
     - cron: "17 7 * * *" # daily
 
@@ -95,6 +98,39 @@ jobs:
 
           echo "fastest mirror reported: $(tail -n1 /tmp/find.stdout)"
 
+      - name: End-to-end apt timing (update + install ffmpeg)
+        run: |
+          # Measures what users actually experience: full apt-get update (all
+          # metadata files incl. Contents, ~150+ MB total) plus a real package
+          # download+install through the runner's own mirror+file config.
+          # stdout/stderr stream live; durations and exit codes -> /tmp/e2e.log
+          set -o pipefail
+          : > /tmp/e2e.log
+
+          record() { # phase, secs, rc
+            printf '%s\t%.1f\t%s\n' "$1" "$2" "$3" | tee -a /tmp/e2e.log
+          }
+
+          # clear cached list metadata so apt-get update is a full cold run
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get clean
+
+          now() { date +%s.%N; }
+          dur() { awk -v e="$1" -v s="$2" 'BEGIN{printf "%.1f", e-s}'; }
+
+          t0=$(now)
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update 2>&1 | tee /dev/stderr
+          rc=${PIPESTATUS[0]}
+          record "apt-get update (cold)" "$(dur "$(now)" "$t0")" "$rc"
+
+          t0=$(now)
+          # ffmpeg is preinstalled on the runners; --reinstall forces a real
+          # download of the .deb + binary libs through the configured mirrors
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -y -qq \
+            --reinstall --no-install-recommends install ffmpeg 2>&1 | tee /dev/stderr
+          rc=${PIPESTATUS[0]}
+          record "apt-get install --reinstall ffmpeg" "$(dur "$(now)" "$t0")" "$rc"
+
       - name: Write run summary
         if: always()
         run: |
@@ -140,6 +176,15 @@ jobs:
             echo "### Final result line"
             echo
             echo "$(tail -n1 /tmp/find.stdout 2>/dev/null)"
+            echo
+            echo "## End-to-end apt timing (real \$\(apt-get\), sequential)"
+            echo
+            echo "| phase | seconds | exit |"
+            echo "|---|---|---|"
+            while IFS=$'\t' read -r phase secs rc; do
+              [ -n "$phase" ] || continue
+              printf '| %s | %s | %s |\n' "$phase" "$secs" "$rc"
+            done < /tmp/e2e.log
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw logs
@@ -152,4 +197,5 @@ jobs:
             /tmp/baseline.tsv
             /tmp/find.log
             /tmp/find.stdout
+            /tmp/e2e.log
           if-no-files-found: warn
