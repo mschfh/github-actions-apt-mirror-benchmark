@@ -80,6 +80,9 @@ jobs:
           # `find` without --apply changes nothing on the system.
           # healthchecks 40 (reachability HEAD probes, few bytes each);
           # speedtests 10 = top-10 US mirrors + current mirror + archive reference.
+          # stdout -> /tmp/find.stdout (tool emits the final ranking line there
+          # when stdout is piped); stderr -> streamed live AND captured via tee
+          # so you can follow the probe/speed-test progress in the Actions log.
           /tmp/fast-apt-mirror.sh find \
             --country US \
             --ignore-sync-state \
@@ -88,11 +91,9 @@ jobs:
             --parallel 1 \
             --sample-size "$SAMPLE_SIZE_KB" \
             --sample-time "$SAMPLE_TIME" \
-            -v 2> /tmp/find.log || echo "WARNING: fast-apt-mirror.sh exit: $?"
+            -v > /tmp/find.stdout 2> >(tee /tmp/find.log >&2) || echo "WARNING: fast-apt-mirror.sh exit: $?"
 
-          echo "::group::find log (tail)"
-          tail -n 40 /tmp/find.log || true
-          echo "::endgroup::"
+          echo "fastest mirror reported: $(tail -n1 /tmp/find.stdout)"
 
       - name: Write run summary
         if: always()
@@ -135,6 +136,10 @@ jobs:
             echo '```'
             grep ' -> ' /tmp/find.log | grep -v '/s)' | head -n 60 || true
             echo '```'
+            echo
+            echo "### Final result line"
+            echo
+            echo "$(tail -n1 /tmp/find.stdout 2>/dev/null)"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload raw logs
@@ -146,4 +151,5 @@ jobs:
           path: |
             /tmp/baseline.tsv
             /tmp/find.log
+            /tmp/find.stdout
           if-no-files-found: warn
