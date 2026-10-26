@@ -1,0 +1,149 @@
+# Benchmarks APT mirrors on GitHub-hosted Ubuntu runners (amd64 + arm64).
+#
+# Read-only: never modifies sources.list / apt-mirrors.txt (fast-apt-mirror.sh `find`
+# without `--apply` only probes and measures).
+#
+# Tool: https://github.com/vegardit/fast-apt-mirror.sh (pinned to commit 806c59276adfff2df420124ad5e4587f018c358a = tag 1.4.5)
+#   - resolves the runner's mirror+file:/etc/apt/apt-mirrors.txt exactly like apt,
+#     so priority:1 (azure.archive.ubuntu.com) is always tested as "current"
+#   - on arm64 it rewrites candidates to the /ubuntu-ports tree
+#   - sequential speed tests (--parallel 1) so runs don't affect each other
+#   - sample: ls-lR.gz (~37 MB), identical file on /ubuntu and /ubuntu-ports trees
+#
+# What fast-apt-mirror.sh does NOT cover, measured here with curl instead:
+#   - every entry of /etc/apt/apt-mirrors.txt (archive, security fallbacks)
+#     with the identical ls-lR.gz sample => apples-to-apples baseline numbers
+name: apt-mirror-benchmark
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 7 * * *" # daily
+
+permissions:
+  contents: read
+
+env:
+  # fast-apt-mirror.sh, tag 1.4.5 (same content immutable at this commit sha)
+  TOOL_VERSION: "806c59276adfff2df420124ad5e4587f018c358a"
+  SAMPLE_SIZE_KB: "37800" # ~37 MB = full ls-lR.gz (archive & ports ship the same file), the max useful sample
+  SAMPLE_TIME: "30"
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          # NOTE: there is no "ubuntu-latest-arm" label (yet); this is the current ARM label
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    name: bench-${{ matrix.arch }}
+
+    steps:
+      - name: Show runner apt mirror configuration
+        run: |
+          echo "::group::/etc/apt/apt-mirrors.txt"
+          cat /etc/apt/apt-mirrors.txt || true
+          echo "::endgroup::"
+          echo "::group::apt sources (URIs)"
+          grep -E "^(URIs:|deb http)" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Download fast-apt-mirror.sh (pinned)
+        run: |
+          curl -fsSL -o /tmp/fast-apt-mirror.sh \
+            "https://raw.githubusercontent.com/vegardit/fast-apt-mirror.sh/${TOOL_VERSION}/fast-apt-mirror.sh"
+          chmod +x /tmp/fast-apt-mirror.sh
+
+      # ---- everything below runs strictly sequentially --------------------------
+
+      - name: Baseline — every /etc/apt/apt-mirrors.txt entry in priority order
+        run: |
+          set -uo pipefail
+          : > /tmp/baseline.tsv
+          cut -f1 /etc/apt/apt-mirrors.txt | awk '/^https?:/ && !seen[$0]++' | while IFS= read -r mirror; do
+            echo "timing ${mirror}ls-lR.gz"
+            stats=$(curl -fsL -m "$SAMPLE_TIME" -sS -o /dev/null \
+                    -w '%{http_code}\t%{time_starttransfer}\t%{size_download}\t%{speed_download}' \
+                    "${mirror}ls-lR.gz") || true
+            [ -n "$stats" ] || stats=$(printf '000\t0\t0\t0')
+            printf '%s\t%s\n' "$mirror" "$stats" | tee -a /tmp/baseline.tsv
+          done
+
+      - name: Benchmark top 10 US mirrors + current (fast-apt-mirror.sh)
+        run: |
+          # `find` without --apply changes nothing on the system.
+          # healthchecks 40 (reachability HEAD probes, few bytes each);
+          # speedtests 10 = top-10 US mirrors + current mirror + archive reference.
+          /tmp/fast-apt-mirror.sh find \
+            --country US \
+            --ignore-sync-state \
+            --healthchecks 40 \
+            --speedtests 10 \
+            --parallel 1 \
+            --sample-size "$SAMPLE_SIZE_KB" \
+            --sample-time "$SAMPLE_TIME" \
+            -v 2> /tmp/find.log || echo "WARNING: fast-apt-mirror.sh exit: $?"
+
+          echo "::group::find log (tail)"
+          tail -n 40 /tmp/find.log || true
+          echo "::endgroup::"
+
+      - name: Write run summary
+        if: always()
+        run: |
+          {
+            echo "# APT mirror benchmark — ${{ matrix.arch }}"
+            echo
+            run_date=$(date -u +'%Y-%m-%d %H:%M UTC')
+            echo "Runner \`${{ runner.name }}\` · ${run_date} · tool fast-apt-mirror.sh ${TOOL_VERSION}"
+            echo
+            echo "## Runner apt failover config"
+            echo
+            echo '```'
+            cat /etc/apt/apt-mirrors.txt 2>/dev/null || echo "(not present)"
+            echo '```'
+            echo
+            echo "## Baseline — apt-mirrors.txt entries (cut -f1), in priority order"
+            echo
+            echo "Sequential curl on \`\${mirror}ls-lR.gz\` (~37 MB), ${SAMPLE_TIME}s max each."
+            echo
+            echo "| mirror | http | TTFB (s) | size | speed |"
+            echo "|---|---|---|---|---|"
+            while IFS=$'\t' read -r mirror code ttfb bytes speed; do
+              [ -n "$mirror" ] || continue
+              printf '| %s | %s | %s | %s MB | %s |\n' "$mirror" "$code" "$ttfb" \
+                "$(awk -v b="${bytes:-0}" 'BEGIN{printf "%.1f", b/1048576}')" \
+                "$(awk -v s="${speed:-0}" 'BEGIN{printf "%.2f MB/s", s/1048576}')"
+            done < /tmp/baseline.tsv
+            echo
+            echo "## fast-apt-mirror.sh top-10 US + current (37 MB, sequential)"
+            echo
+            echo "### Speed ranking"
+            echo
+            echo '```'
+            grep ' -> ' /tmp/find.log | grep '/s)' | tail -n 15 || true
+            echo '```'
+            echo
+            echo "### Probe results"
+            echo
+            echo '```'
+            grep ' -> ' /tmp/find.log | grep -v '/s)' | head -n 60 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mirrorbench-${{ matrix.arch }}-${{ github.run_number }}
+          retention-days: 90
+          path: |
+            /tmp/baseline.tsv
+            /tmp/find.log
+          if-no-files-found: warn
