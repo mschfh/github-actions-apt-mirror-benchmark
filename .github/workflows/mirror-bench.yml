@@ -99,7 +99,7 @@ jobs:
           while IFS= read -r mirror; do
             host=$(printf '%s\n' "$mirror" | sed -n 's|^https\?://\([^/]*\)/.*|\1|p')
             printf '%s => ' "$host"
-            dig A "$host" | tr '\n' ' '; echo
+            dig A "$host"
           done
 
       - name: Download fast-apt-mirror.sh (pinned)
@@ -174,72 +174,31 @@ jobs:
             echo "APT_DEBUG on: per-request connect IP / HTTP lines enabled"
           fi
 
-          # clear cached list metadata so apt-get update is a full cold run
-          sudo rm -rf /var/lib/apt/lists/*
-          sudo apt-get clean
-
           # Which IP does each configured mirror host resolve to? All fetches
-          # below go through these (azure = single regional CDN IP).
+          # below go through these, starting with priority-1 azure (a single
+          # regional CDN IP).
           echo "::group::Mirror host -> resolved IP"
           cut -f1 /etc/apt/apt-mirrors.txt | awk '/^https?:/ && !seen[$0]++' | \
           while IFS= read -r mirror; do
             host=$(printf '%s\n' "$mirror" | sed -n 's|^https\?://\([^/]*\)/.*|\1|p')
-            printf '%s => %s\n' "$host" "$(dig +short A "$host" | tr '\n' ' ')"
+            echo "$host:"
+            dig +short A "$host"
           done
           echo "::endgroup::"
 
-          run_apt() { # log-file, args...
-            log=$1; shift
-            t0=$(date +%s.%N)
-            sudo apt-get "$@" 2>&1 | tee "$log"
-            rc=${PIPESTATUS[0]}
-            t1=$(date +%s.%N)
-            secs=$(awk -v e="$t1" -v s="$t0" 'BEGIN{printf "%.1f", e-s}')
-            printf '%s\t%.1f\trc=%s\n' "$log" "$secs" "$rc" | tee -a /tmp/e2e.log
-            echo "=== exit: $rc ==="
-            return $rc
-          }
-
-          run_apt /tmp/e2e-update.log -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
-            $debug_opts update
-          rc_update=$?
-
-          PKGS="yajl-tools ffmpeg libsm6 libxext6 libxml2-dev libxslt-dev"
-
-          # Variant A: pristine runner config (99bad_proxy active:
-          # Pipeline-Depth 0, No-Cache true)
-          run_apt /tmp/e2e-install.log -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
-            $debug_opts -y -d --no-install-recommends install $PKGS
-          rc_a=$?
-
-          # Remove fetched .debs so variant B actually re-downloads
-          sudo rm -f /var/cache/apt/archives/*.deb
-
-          # Variant B: identical command but pipelining + cache re-enabled
-          # (counteract 99bad_proxy). Proves/disproves causation for the
-          # minute-long stalls on small .debs.
-          run_apt /tmp/e2e-install-b.log -o Acquire::Retries=3 \
-            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
-            -o Acquire::http::Pipeline-Depth=10 -o Acquire::https::Pipeline-Depth=10 \
-            -o Acquire::http::No-Cache=false -o Acquire::https::No-Cache=false \
-            $debug_opts -y -d --no-install-recommends install $PKGS
-          rc_b=$?
-
-          echo "rc update=$rc_update A=$rc_a B=$rc_b"
-          echo "::group::A/B verdict"
-          echo "variant A (as-shipped):   $(grep e2e-install.log /tmp/e2e.log | head -1)"
-          echo "variant B (pipelined):    $(grep e2e-install-b.log /tmp/e2e.log | head -1)"
-          # effective merged config as variant B's apt-get invocation sees it
-          # (apt-config accepts the same -o overrides; shows the final numbers)
-          echo "variant B effective config:"
-          apt-config \
-            -o Acquire::http::Pipeline-Depth=10 -o Acquire::https::Pipeline-Depth=10 \
-            -o Acquire::http::No-Cache=false -o Acquire::https::No-Cache=false \
-            dump | grep -iE 'Pipeline-Depth|No-Cache' || true
-          echo "::endgroup::"
-          [ "$rc_a" -eq 0 ] && [ "$rc_b" -eq 0 ]
+          # Single timed invocation, the runner's pristine config, no wiping
+          # or forced update beforehand. -d = download .debs only, no install.
+          t0=$(date +%s.%N)
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 \
+            -o Acquire::https::Timeout=15 $debug_opts -y -d --no-install-recommends \
+            install yajl-tools ffmpeg libsm6 libxext6 libxml2-dev libxslt-dev \
+            2>&1 | tee /tmp/e2e-install.log
+          rc=$?
+          t1=$(date +%s.%N)
+          secs=$(awk -v e="$t1" -v s="$t0" 'BEGIN{printf "%.1f", e-s}')
+          printf 'install\t%.1f\trc=%s\n' "$secs" "$rc" | tee -a /tmp/e2e.log
+          echo "=== install wall-clock: ${secs}s, exit: $rc ==="
+          [ "$rc" -eq 0 ]
 
       - name: Per-URL timed fetch — every index target apt update would download
         run: |
@@ -315,7 +274,7 @@ jobs:
             echo
             echo "## End-to-end apt timing (real \$\(apt-get\), sequential)"
             echo
-            for f in /tmp/e2e-update.log /tmp/e2e-install.log; do
+            for f in /tmp/e2e-install.log; do
               echo "### \`$f\` — summary"
               echo
               echo '```'
@@ -351,7 +310,6 @@ jobs:
             /tmp/baseline.tsv
             /tmp/find.log
             /tmp/find.stdout
-            /tmp/e2e-update.log
             /tmp/e2e-install.log
             /tmp/perfile.tsv
             /tmp/perfile.total
