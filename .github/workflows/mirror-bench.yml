@@ -157,7 +157,11 @@ jobs:
 
       - name: End-to-end apt timing (update + install ffmpeg)
         env:
-          APT_DEBUG: ${{ inputs.apt_debug }}
+          # inputs.* only exist for workflow_dispatch; on push/schedule events
+          # they are empty, which would silently disable the debug opts.
+          # Default it ON for any non-dispatch event; the dispatch input (boolean,
+          # default false) still controls it for manual runs.
+          APT_DEBUG: ${{ inputs.apt_debug == true || github.event_name != 'workflow_dispatch' }}
         run: |
           # Measures what users actually experience: full apt-get update (all
           # metadata files incl. Contents, ~150+ MB total) plus a real package
