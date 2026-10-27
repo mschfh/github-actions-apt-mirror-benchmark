@@ -57,6 +57,19 @@ jobs:
           grep -E "^(URIs:|deb http)" /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
           echo "::endgroup::"
 
+      - name: DNS resolution of configured mirror hosts
+        run: |
+          # dig/dnsutils is preinstalled on the runner images and shows all A
+          # records. azure (prio 1) is a regional cloud mirror: it resolves to
+          # ONE IP of the region's CDN, while archive.ubuntu.com rotates via
+          # round-robin DNS across ~10 IPs.
+          cut -f1 /etc/apt/apt-mirrors.txt | awk '/^https?:/ && !seen[$0]++' | \
+          while IFS= read -r mirror; do
+            host=$(printf '%s\n' "$mirror" | sed -n 's|^https\?://\([^/]*\)/.*|\1|p')
+            printf '%s => ' "$host"
+            dig +short A "$host" | tr '\n' ' '; echo
+          done
+
       - name: Download fast-apt-mirror.sh (pinned)
         run: |
           curl -fsSL -o /tmp/fast-apt-mirror.sh \
