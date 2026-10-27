@@ -17,11 +17,6 @@ name: apt-mirror-benchmark
 
 on:
   workflow_dispatch:
-    inputs:
-      apt_debug:
-        description: "Verbose apt Acquire debug (per-request connect IP / HTTP lines)"
-        type: boolean
-        default: false
   push:
     branches:
       - main
@@ -156,12 +151,6 @@ jobs:
           interval_seconds: "5"
 
       - name: End-to-end apt timing (update + install ffmpeg)
-        env:
-          # inputs.* only exist for workflow_dispatch; on push/schedule events
-          # they are empty, which would silently disable the debug opts.
-          # Default it ON for any non-dispatch event; the dispatch input (boolean,
-          # default false) still controls it for manual runs.
-          APT_DEBUG: ${{ inputs.apt_debug == true || github.event_name != 'workflow_dispatch' }}
         run: |
           # Measures what users actually experience: full apt-get update (all
           # metadata files incl. Contents, ~150+ MB total) plus a real package
@@ -172,11 +161,21 @@ jobs:
           # first so every Get: line is attributable to a known edge IP.
           set -u
 
-          debug_opts=""
-          if [ "$APT_DEBUG" = "true" ]; then
-            debug_opts="-o Debug::Acquire::http=true -o Debug::Acquire::https=true"
-            echo "APT_DEBUG on: per-request connect IP / HTTP lines enabled"
-          fi
+          # Per-request apt Acquire debug, always on — the plain Get:/Fetched
+          # lines never show the remote IP or method internals:
+          #   Debug::Acquire::http      - http method: per-request target host
+          #                               + resolved connect IP, response codes,
+          #                               connection reuse, partial/data lines
+          #   Debug::Acquire::https     - same for the https method (no proxy
+          #                               CONNECT detail on runners though)
+          #   Debug::pkgAcquire::Worker - raw worker<->method chatter, incl.
+          #                               failures, retries and stalled-idle
+          #                               responses
+          #   Debug::Acquire::mirror    - mirror failover selection/switches
+          # Note: apt does not log per-request wall-clock or bandwidth; the
+          # per-URL curl step below measures that.
+          debug_opts="-o Debug::Acquire::http=true -o Debug::Acquire::https=true"
+          debug_opts="$debug_opts -o Debug::pkgAcquire::Worker=true -o Debug::Acquire::mirror=true"
 
           # Which IP does each configured mirror host resolve to? All fetches
           # below go through these, starting with priority-1 azure (a single
