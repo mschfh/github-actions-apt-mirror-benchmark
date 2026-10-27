@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # actions-workflow-metrics: per-step metrics via GitHub API
 
 env:
   # fast-apt-mirror.sh, tag 1.4.5 (same content immutable at this commit sha)
@@ -111,25 +112,17 @@ jobs:
 
           echo "fastest mirror reported: $(tail -n1 /tmp/find.stdout)"
 
-      - name: Telemetry (instruments only the steps after this point)
-        # Node16 runtime — expect a deprecation warning; kept because requested.
-        # Known issues (verified in action source + run log):
-        #  - chart rendering in the post step calls api.globadge.com anonymously
-        #    and gets 403 on GH runner IPs -> no charts, but raw-stats.json
-        #    artifact is still produced, and the job itself still succeeds.
-        #  - process tracing is unsupported on Ubuntu 24.04 (only ubuntu-20/22
-        #    native tracers shipped) -> proc_trace* inputs are no-ops here.
-        #  - metric_frequency_thousands_of_second is actually milliseconds;
-        #    1 = 1 ms sampling (heavy; watch for benchmark distortion).
-        uses: tum-i4/workflow-telemetry-action@69c3d3de0e4c61f8a5f67d9ec6e8bafefdafe287 # v1.0
+      - name: Enable workflow metrics (instruments only the steps after this point)
+        # Replacement for tum-i4/workflow-telemetry-action: renders Mermaid
+        # charts of CPU load / memory usage directly into the job summary
+        # from a localhost collection server (127.0.0.1:7777) — no third-party
+        # chart API, so no 403s. Node24 runtime (no deprecation warning).
+        # Only inputs are github_token and interval_seconds; process tracing
+        # does not exist in this action (the old action's proc_trace flags
+        # were no-ops on Ubuntu 24.04 anyway).
+        uses: dev-hato/actions-workflow-metrics@17543dcae6053a945244b76ec3224f0e4b9395c6 # v0.0.9
         with:
-          proc_trace_sys_enable: true
-          proc_trace_min_duration: 100 # ms; skip micro processes
-          proc_trace_chart_show: true
-          proc_trace_table_show: true
-          comment_on_pr: false
-          job_summary: true
-          metric_frequency_thousands_of_second: 1
+          interval_seconds: "5"
 
       - name: End-to-end apt timing (update + install ffmpeg)
         run: |
