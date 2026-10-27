@@ -113,17 +113,23 @@ jobs:
 
       - name: Telemetry (instruments only the steps after this point)
         # Node16 runtime — expect a deprecation warning; kept because requested.
-        # Alternative: catchpoint/workflow-telemetry-action@v2 (upstream this
-        # was forked from, node20). If scoping ever needs to be tighter, the
-        # only native way is moving the e2e apt step into its own job.
+        # Known issues (verified in action source + run log):
+        #  - chart rendering in the post step calls api.globadge.com anonymously
+        #    and gets 403 on GH runner IPs -> no charts, but raw-stats.json
+        #    artifact is still produced, and the job itself still succeeds.
+        #  - process tracing is unsupported on Ubuntu 24.04 (only ubuntu-20/22
+        #    native tracers shipped) -> proc_trace* inputs are no-ops here.
+        #  - metric_frequency_thousands_of_second is actually milliseconds;
+        #    1 = 1 ms sampling (heavy; watch for benchmark distortion).
         uses: tum-i4/workflow-telemetry-action@69c3d3de0e4c61f8a5f67d9ec6e8bafefdafe287 # v1.0
         with:
+          proc_trace_sys_enable: true
           proc_trace_min_duration: 100 # ms; skip micro processes
           proc_trace_chart_show: true
-          proc_trace_table_show: false
+          proc_trace_table_show: true
           comment_on_pr: false
           job_summary: true
-          metric_frequency_thousands_of_second: 250
+          metric_frequency_thousands_of_second: 1
 
       - name: End-to-end apt timing (update + install ffmpeg)
         run: |
@@ -155,7 +161,7 @@ jobs:
           # full .deb + lib set to be downloaded through the configured mirrors,
           # while -d (download-only) leaves the system untouched
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -y -qq \
-            --reinstall -d --no-install-recommends install ffmpeg 2>&1 | tee /dev/stderr
+            --reinstall -d --no-install-recommends install yajl-tools ffmpeg libsm6 libxext6 libxml2-dev libxslt-dev 2>&1 | tee /dev/stderr
           rc=${PIPESTATUS[0]}
           record "apt-get install -d --reinstall ffmpeg (download only)" "$(dur "$(now)" "$t0")" "$rc"
 
