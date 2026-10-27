@@ -17,6 +17,11 @@ name: apt-mirror-benchmark
 
 on:
   workflow_dispatch:
+    inputs:
+      apt_debug:
+        description: "Verbose apt Acquire debug (per-request connect IP / HTTP lines)"
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -68,7 +73,7 @@ jobs:
           while IFS= read -r mirror; do
             host=$(printf '%s\n' "$mirror" | sed -n 's|^https\?://\([^/]*\)/.*|\1|p')
             printf '%s => ' "$host"
-            dig +short A "$host" | tr '\n' ' '; echo
+            dig A "$host" | tr '\n' ' '; echo
           done
 
       - name: Download fast-apt-mirror.sh (pinned)
@@ -125,38 +130,59 @@ jobs:
           interval_seconds: "5"
 
       - name: End-to-end apt timing (update + install ffmpeg)
+        env:
+          APT_DEBUG: ${{ inputs.apt_debug }}
         run: |
           # Measures what users actually experience: full apt-get update (all
           # metadata files incl. Contents, ~150+ MB total) plus a real package
           # download+install through the runner's own mirror+file config.
-          # stdout/stderr stream live; durations and exit codes -> /tmp/e2e.log
-          set -o pipefail
-          : > /tmp/e2e.log
+          #
+          # Output: apt runs raw (no -qq, uncondensed Get:/Fetched/progress
+          # lines) mirrored live to stdout; per-mirror resolved IP printed
+          # first so every Get: line is attributable to a known edge IP.
+          set -u
 
-          record() { # phase, secs, rc
-            printf '%s\t%.1f\t%s\n' "$1" "$2" "$3" | tee -a /tmp/e2e.log
-          }
+          debug_opts=""
+          if [ "$APT_DEBUG" = "true" ]; then
+            debug_opts="-o Debug::Acquire::http=true -o Debug::Acquire::https=true"
+            echo "APT_DEBUG on: per-request connect IP / HTTP lines enabled"
+          fi
 
           # clear cached list metadata so apt-get update is a full cold run
           sudo rm -rf /var/lib/apt/lists/*
           sudo apt-get clean
 
-          now() { date +%s.%N; }
-          dur() { awk -v e="$1" -v s="$2" 'BEGIN{printf "%.1f", e-s}'; }
+          # Which IP does each configured mirror host resolve to? All fetches
+          # below go through these (azure = single regional CDN IP).
+          echo "::group::Mirror host -> resolved IP"
+          cut -f1 /etc/apt/apt-mirrors.txt | awk '/^https?:/ && !seen[$0]++' | \
+          while IFS= read -r mirror; do
+            host=$(printf '%s\n' "$mirror" | sed -n 's|^https\?://\([^/]*\)/.*|\1|p')
+            printf '%s => %s\n' "$host" "$(dig +short A "$host" | tr '\n' ' ')"
+          done
+          echo "::endgroup::"
 
-          t0=$(now)
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update 2>&1 | tee /dev/stderr
-          rc=${PIPESTATUS[0]}
-          record "apt-get update (cold)" "$(dur "$(now)" "$t0")" "$rc"
+          run_apt() { # log-file, args...
+            log=$1; shift
+            sudo apt-get "$@" 2>&1 | tee "$log"
+            rc=${PIPESTATUS[0]}
+            echo "=== exit: $rc ==="
+            return $rc
+          }
 
-          t0=$(now)
-          # ffmpeg is preinstalled on the runners; -d + --reinstall forces the
-          # full .deb + lib set to be downloaded through the configured mirrors,
-          # while -d (download-only) leaves the system untouched
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -y -qq \
-            --reinstall -d --no-install-recommends install yajl-tools ffmpeg libsm6 libxext6 libxml2-dev libxslt-dev 2>&1 | tee /dev/stderr
-          rc=${PIPESTATUS[0]}
-          record "apt-get install -d --reinstall ffmpeg (download only)" "$(dur "$(now)" "$t0")" "$rc"
+          run_apt /tmp/e2e-update.log -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+            $debug_opts update
+          rc_update=$?
+
+          run_apt /tmp/e2e-install.log -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+            $debug_opts -y --reinstall -d --no-install-recommends install \
+            yajl-tools ffmpeg libsm6 libxext6 libxml2-dev libxslt-dev
+          rc_install=$?
+
+          echo "rc update=$rc_update install=$rc_install"
+          [ "$rc_install" -eq 0 ] && [ "$rc_update" -eq 0 ]
 
       - name: Per-URL timed fetch — every index target apt update would download
         run: |
@@ -232,13 +258,14 @@ jobs:
             echo
             echo "## End-to-end apt timing (real \$\(apt-get\), sequential)"
             echo
-            echo "| phase | seconds | exit |"
-            echo "|---|---|---|"
-            while IFS=$'\t' read -r phase secs rc; do
-              [ -n "$phase" ] || continue
-              printf '| %s | %s | %s |\n' "$phase" "$secs" "$rc"
-            done < /tmp/e2e.log
-            echo
+            for f in /tmp/e2e-update.log /tmp/e2e-install.log; do
+              echo "### \`$f\` — summary"
+              echo
+              echo '```'
+              grep -E '^Fetched |^Need to get|^After this operation|^=== exit' "$f" | sort -u | head -n 6
+              echo '```'
+              echo
+            done
             echo "## Per-URL index timing (apt-get indextargets URIs, sequential curl)"
             echo
             echo "Total: \`$(cat /tmp/perfile.total 2>/dev/null || echo "n/a")\`"
@@ -267,7 +294,8 @@ jobs:
             /tmp/baseline.tsv
             /tmp/find.log
             /tmp/find.stdout
-            /tmp/e2e.log
+            /tmp/e2e-update.log
+            /tmp/e2e-install.log
             /tmp/perfile.tsv
             /tmp/perfile.total
             /tmp/targets.txt
